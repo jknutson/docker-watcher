@@ -133,6 +133,7 @@ func main() {
 				containerCmd := strings.Join(inspectResponse.Config.Cmd, " ")
 				exitCode := msg.Actor.Attributes["exitCode"]
 
+				// TOOD: abstract this out to a struct that can pass to datadog/stdout/etc.
 				var eventTitle string
 				eventMessage := fmt.Sprintf("Name: %s\n", msg.Actor.Attributes["name"])
 				eventMessage = fmt.Sprintf("%sID: %s\n", eventMessage, msg.Actor.ID)
@@ -167,9 +168,10 @@ func main() {
 					}
 				} else if msg.Action == "exec_die" {
 					if inspectResponse.State.Status == "unhealthy" {
-						eventTitle := fmt.Sprintf("%s container is unhealthy", fromContainer)
-						event := statsd.NewEvent(eventTitle, eventMessage)
+						// eventTitle := fmt.Sprintf("%s container is unhealthy", fromContainer)
+						//  event := statsd.NewEvent(eventTitle, eventMessage)
 						// container is unhealthy
+						debug("nil")
 					}
 				}
 			}
