@@ -66,7 +66,7 @@ func setupCloseHandler() {
 	}()
 }
 
-func datadogEvent(c *statsd.Client, e ContainerEvent) {
+func dogstatsdEvent(c *statsd.Client, e ContainerEvent) {
 	event := statsd.NewEvent(e.Title, e.Body)
 	event.AggregationKey = e.ContainerID
 	event.AlertType = statsd.Error
@@ -76,7 +76,7 @@ func datadogEvent(c *statsd.Client, e ContainerEvent) {
 	if err != nil {
 		log.Fatal(err)
 	} else {
-		log.Println("successfully sent event to datadog")
+		log.Println("sent event to dogstatsd")
 	}
 }
 
@@ -142,6 +142,7 @@ func main() {
 					fromContainer := msg.From
 					containerCmd := strings.Join(inspectResponse.Config.Cmd, " ")
 
+					// TODO: try a template here
 					containerEvent.Body = fmt.Sprintf("Name: %s\n", msg.Actor.Attributes["name"])
 					containerEvent.Body = fmt.Sprintf("%sID: %s\n", containerEvent.Body, msg.Actor.ID)
 					containerEvent.Body = fmt.Sprintf("%sImage: %s\n", containerEvent.Body, msg.Actor.Attributes["image"])
@@ -155,7 +156,7 @@ func main() {
 					}
 
 					if output == "datadog" {
-						datadogEvent(dogstatsdClient, containerEvent)
+						dogstatsdEvent(dogstatsdClient, containerEvent)
 					} else {
 						fmt.Printf("\n%q\n", containerEvent)
 					}
