@@ -41,7 +41,7 @@ Exit Code: {{.ExitCode}}
 ID: {{.ContainerID}}
 `
 
-const stdoutEventTemplate = `{{.ContainerName}} exited non-zero: {{.ExitCode}}
+const stdoutEventTemplate = `{{.ContainerName}} {{if eq .Action "exec_die" }}process{{end}} exited non-zero: {{.ExitCode}}
 Action: {{.EventMessage.Action}}
 Image: {{.Image}}
 ID: {{.ContainerID}}
@@ -96,9 +96,7 @@ func evalTemplate(t string, e ContainerEvent) string {
 }
 
 func dogstatsdEvent(c *statsd.Client, e ContainerEvent) {
-	eventBody := evalTemplate(datadogEventTemplate, e)
-
-	event := statsd.NewEvent(e.Title, eventBody)
+	event := statsd.NewEvent(e.Title, e.Body)
 	event.AggregationKey = e.ContainerID
 	event.AlertType = statsd.Error
 	event.SourceTypeName = "DOCKER"
@@ -130,22 +128,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = dogstatsdClient.SimpleEvent("docker-watcher started", "huzzah")
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	// setup docker client
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	cli.NegotiateAPIVersion(ctx)
 
-	msgs, errs := cli.Events(ctx, types.EventsOptions{})
-
 	log.Println("listening for docker events")
+	msgs, errs := cli.Events(ctx, types.EventsOptions{})
 	for {
 		select {
 		case err := <-errs:
@@ -153,24 +146,27 @@ func main() {
 		case msg := <-msgs:
 			if msg.Type == "container" && (msg.Action == "die" || msg.Action == "exec_die") {
 				if msg.Actor.Attributes["exitCode"] != "0" {
-					inspectResponse, err := cli.ContainerInspect(ctx, msg.Actor.ID)
-					if err != nil {
-						log.Fatal(err)
-					}
-					// debugging -- print event msg and container inspect in JSON
-					if os.Getenv("DEBUG") != "" {
-						var inspectJSON []byte
-						var msgJSON []byte
-						if os.Getenv("DEBUG") == "pretty" {
-							inspectJSON, err = json.MarshalIndent(inspectResponse, "", "  ")
-							if err != nil {
-								log.Fatal(err)
+					if exitCode != "0" {
+						// inspect container
+						inspectResponse, err := cli.ContainerInspect(ctx, msg.Actor.ID)
+						if err != nil {
+							log.Fatal(err)
+						}
+						// debugging -- print event msg and container inspect in JSON
+						if os.Getenv("DEBUG") != "" {
+							var inspectJSON []byte
+							var msgJSON []byte
+							if os.Getenv("DEBUG") == "pretty" {
+								inspectJSON, err = json.MarshalIndent(inspectResponse, "", "  ")
+								if err != nil {
+									log.Fatal(err)
+								}
+								msgJSON, err = json.MarshalIndent(msg, "", "  ")
+								if err != nil {
+									log.Fatal(err)
+								}
+								fmt.Printf("\n%s\n%s\n", string(inspectJSON), string(msgJSON))
 							}
-							msgJSON, err = json.MarshalIndent(msg, "", "  ")
-							if err != nil {
-								log.Fatal(err)
-							}
-							fmt.Printf("\n%s\n%s\n", string(inspectJSON), string(msgJSON))
 						}
 
 						containerEvent := ContainerEvent{
@@ -184,6 +180,12 @@ func main() {
 
 						for key, value := range inspectResponse.Config.Labels {
 							containerEvent.Tags = append(containerEvent.Tags, fmt.Sprintf("%s=%s", key, value))
+						}
+
+						if msg.Action == "die" {
+							containerEvent.Title = fmt.Sprintf("%s container exited non-zero: %s", fromContainer, exitCode)
+						} else if msg.Action == "exec_die" {
+							containerEvent.Title = fmt.Sprintf("%s container process exited non-zero: %s", fromContainer, exitCode)
 						}
 
 						if output == "datadog" {
