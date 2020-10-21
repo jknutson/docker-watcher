@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -10,9 +11,11 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"text/template"
 
 	"github.com/DataDog/datadog-go/statsd"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
 )
 
@@ -25,11 +28,24 @@ var (
 
 // ContainerEvent holds parameters for a Container Event
 type ContainerEvent struct {
-	Title       string
-	Body        string
-	ContainerID string
-	Tags        []string
+	ContainerID, ContainerName, Image string
+	Title, Body, Cmd, ExitCode        string
+	Action                            string
+	Tags                              []string
+	EventMessage                      events.Message
 }
+
+const datadogEventTemplate = `Name: {{.ContainerName}}
+Image: {{.Image}}
+Exit Code: {{.ExitCode}}
+ID: {{.ContainerID}}
+`
+
+const stdoutEventTemplate = `{{.ContainerName}} {{if eq .Action "exec_die" }}process{{end}} exited non-zero: {{.ExitCode}}
+Action: {{.EventMessage.Action}}
+Image: {{.Image}}
+ID: {{.ContainerID}}
+`
 
 func usage() {
 	println(`Usage: docker-watcher [options]
@@ -66,6 +82,19 @@ func setupCloseHandler() {
 	}()
 }
 
+func evalTemplate(t string, e ContainerEvent) string {
+	buf := new(bytes.Buffer)
+	tmpl, err := template.New("containerEventBody").Parse(t)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = tmpl.Execute(buf, e)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return buf.String()
+}
+
 func dogstatsdEvent(c *statsd.Client, e ContainerEvent) {
 	event := statsd.NewEvent(e.Title, e.Body)
 	event.AggregationKey = e.ContainerID
@@ -78,6 +107,11 @@ func dogstatsdEvent(c *statsd.Client, e ContainerEvent) {
 	} else {
 		log.Println("sent event to dogstatsd")
 	}
+}
+
+func stdoutEvent(e ContainerEvent) {
+	eventBody := evalTemplate(stdoutEventTemplate, e)
+	fmt.Println(eventBody)
 }
 
 func main() {
@@ -111,54 +145,54 @@ func main() {
 			fmt.Printf("error: %q", err)
 		case msg := <-msgs:
 			if msg.Type == "container" && (msg.Action == "die" || msg.Action == "exec_die") {
-				exitCode := msg.Actor.Attributes["exitCode"]
-				if exitCode != "0" {
-					// inspect container
-					inspectResponse, err := cli.ContainerInspect(ctx, msg.Actor.ID)
-					if err != nil {
-						log.Fatal(err)
-					}
-					// debugging -- print event msg and container inspect in JSON
-					if os.Getenv("DEBUG") != "" {
-						var inspectJSON []byte
-						var msgJSON []byte
-						inspectJSON, err = json.MarshalIndent(inspectResponse, "", "  ")
+				if msg.Actor.Attributes["exitCode"] != "0" {
+					if exitCode != "0" {
+						// inspect container
+						inspectResponse, err := cli.ContainerInspect(ctx, msg.Actor.ID)
 						if err != nil {
 							log.Fatal(err)
 						}
-						msgJSON, err = json.MarshalIndent(msg, "", "  ")
-						if err != nil {
-							log.Fatal(err)
+						// debugging -- print event msg and container inspect in JSON
+						if os.Getenv("DEBUG") != "" {
+							var inspectJSON []byte
+							var msgJSON []byte
+							if os.Getenv("DEBUG") == "pretty" {
+								inspectJSON, err = json.MarshalIndent(inspectResponse, "", "  ")
+								if err != nil {
+									log.Fatal(err)
+								}
+								msgJSON, err = json.MarshalIndent(msg, "", "  ")
+								if err != nil {
+									log.Fatal(err)
+								}
+								fmt.Printf("\n%s\n%s\n", string(inspectJSON), string(msgJSON))
+							}
 						}
-						fmt.Printf("\n%s\n%s\n", string(inspectJSON), string(msgJSON))
-					}
 
-					containerEvent := ContainerEvent{}
-					containerEvent.ContainerID = msg.Actor.ID
-					for key, value := range inspectResponse.Config.Labels {
-						containerEvent.Tags = append(containerEvent.Tags, fmt.Sprintf("%s=%s", key, value))
-					}
+						containerEvent := ContainerEvent{
+							ContainerID:   msg.Actor.ID,
+							ContainerName: msg.Actor.Attributes["name"],
+							Image:         msg.Actor.Attributes["image"],
+							Cmd:           strings.Join(inspectResponse.Config.Cmd, " "),
+							ExitCode:      msg.Actor.Attributes["exitCode"],
+							EventMessage:  msg,
+						}
 
-					fromContainer := msg.From
-					containerCmd := strings.Join(inspectResponse.Config.Cmd, " ")
+						for key, value := range inspectResponse.Config.Labels {
+							containerEvent.Tags = append(containerEvent.Tags, fmt.Sprintf("%s=%s", key, value))
+						}
 
-					// TODO: try a template here
-					containerEvent.Body = fmt.Sprintf("Name: %s\n", msg.Actor.Attributes["name"])
-					containerEvent.Body = fmt.Sprintf("%sID: %s\n", containerEvent.Body, msg.Actor.ID)
-					containerEvent.Body = fmt.Sprintf("%sImage: %s\n", containerEvent.Body, msg.Actor.Attributes["image"])
-					containerEvent.Body = fmt.Sprintf("%sCmd: %s\n", containerEvent.Body, containerCmd)
-					containerEvent.Body = fmt.Sprintf("%sExit Code: %s\n", containerEvent.Body, exitCode)
+						if msg.Action == "die" {
+							containerEvent.Title = fmt.Sprintf("%s container exited non-zero: %s", fromContainer, exitCode)
+						} else if msg.Action == "exec_die" {
+							containerEvent.Title = fmt.Sprintf("%s container process exited non-zero: %s", fromContainer, exitCode)
+						}
 
-					if msg.Action == "die" {
-						containerEvent.Title = fmt.Sprintf("%s container exited non-zero: %s", fromContainer, exitCode)
-					} else if msg.Action == "exec_die" {
-						containerEvent.Title = fmt.Sprintf("%s container process exited non-zero: %s", fromContainer, exitCode)
-					}
-
-					if output == "datadog" {
-						dogstatsdEvent(dogstatsdClient, containerEvent)
-					} else {
-						fmt.Printf("\n%q\n", containerEvent)
+						if output == "datadog" {
+							dogstatsdEvent(dogstatsdClient, containerEvent)
+						} else {
+							stdoutEvent(containerEvent)
+						}
 					}
 				}
 			}
